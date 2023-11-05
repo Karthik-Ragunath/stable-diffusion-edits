@@ -290,7 +290,7 @@ def main():
     plt.imshow(mask.cpu().detach().numpy(), cmap = 'gray')
     plt.savefig(f'{image_save_path}/mask_image.jpg')
     plt.close()
-
+    mask = mask.to(torch.float16)
     # yt = edit_image(latents, mask, 'A zebra on a grass field with a cloudy sky', strength = 0.3, num_timesteps = 70)
     yt = edit_image(latents, mask, 'A zebra on a grass field with a cloudy sky', scheduler=scheduler, unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, strength = 0.3, num_timesteps = 70)
     with torch.no_grad():
