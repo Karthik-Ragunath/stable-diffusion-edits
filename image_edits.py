@@ -33,9 +33,8 @@ def get_image(image):
     return Image.fromarray(image)
 
 def encode_text(tokenizer, text_encoder, inputs = ['']):
-    # uncond_inputs = [''] * len(inputs) # ['']
-    # all_inputs = uncond_inputs + inputs # ['', 'Horse'] # tokenizer.model_max_length = 77
-    all_inputs = inputs
+    uncond_inputs = [''] * len(inputs) # ['']
+    all_inputs = uncond_inputs + inputs # ['', 'Horse'] # tokenizer.model_max_length = 77
     all_inputs_tokenized = tokenizer(all_inputs, padding = 'max_length', max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to('cuda') # all_inputs_tokenized.shape - torch.Size([2, 77])
     embeddings = text_encoder(all_inputs_tokenized)[0].half() # torch.Size([2, 77, 768]) # text_encoder(all_inputs_tokenized)[1].shape - torch.Size([1, 768]) # len(text_encoder(all_inputs_tokenized)) = 2
     return embeddings
@@ -59,9 +58,9 @@ def add_gaussian_noise_to_image(image, std_dev=0.5):
 
 def convert_to_latents(image_tensor, vae):
   # Make sure image_tensor is a batch object
-  with torch.no_grad():
-    latents = vae.encode(image_tensor).latent_dist.sample()
-  return latents
+    with torch.no_grad():
+        latents = vae.encode(image_tensor).latent_dist.sample()
+    return latents
 
 def main():
     path = "fastdownloads"
@@ -119,6 +118,79 @@ def main():
 
     ref_embs = encode_text(tokenizer, text_encoder, ['Horse'])
     query_embs = encode_text(tokenizer, text_encoder, ['Zebra'])
+
+    # 2. Schedueler
+    num_inference_steps = 30
+    im_tensor = transforms.ToTensor()(img)
+    im_tensor = im_tensor.to(device).to(torch.float16)
+    # latents = convert_to_latents(im_tensor[None, :], vae) # torch.Size([1, 4, 64, 64])
+    # latents_for_computation = add_gaussian_noise(latents) # torch.Size([1, 4, 64, 64])
+
+    noisy_img = add_gaussian_noise_to_image(im_tensor)
+    latents_for_computation = convert_to_latents(noisy_img[None, :], vae)
+    
+    # Denoising Part
+    
+    guidance_scale = 7.5
+    scheduler.set_timesteps(num_inference_steps)
+    latents_for_computation = latents_for_computation * scheduler.init_noise_sigma # torch.Size([1, 4, 64, 64])
+
+    for i, t in enumerate(tqdm(scheduler.timesteps)):
+        input = torch.cat([latents_for_computation]*2) # torch.Size([2, 4, 64, 64])
+        input = scheduler.scale_model_input(input, t) # torch.Size([2, 4, 64, 64])
+
+        # Predict the Noise
+        with torch.no_grad():
+            noise_pred = unet(input, t, encoder_hidden_states = ref_embs).sample # ref_embs.shape - torch.Size([2, 77, 768])
+
+        n_u, n_p = noise_pred.chunk(2)
+        pred = n_u + guidance_scale * (n_p - n_u)
+
+        latents_for_computation = scheduler.step(pred, t, latents_for_computation).prev_sample
+    
+    deocded_latents = decode(latents_for_computation, vae)[0]
+    pil_image = get_image(deocded_latents)
+    pil_image.save(f"{image_save_path}/latent_decoded_image_ref_embeds.jpg")
+
+    # scheduler.timesteps
+    # tensor([999.0000, 964.5517, 930.1035, 895.6552, 861.2069, 826.7586, 792.3104,
+    #     757.8621, 723.4138, 688.9655, 654.5172, 620.0690, 585.6207, 551.1724,
+    #     516.7241, 482.2758, 447.8276, 413.3793, 378.9310, 344.4828, 310.0345,
+    #     275.5862, 241.1379, 206.6897, 172.2414, 137.7931, 103.3448,  68.8966,
+    #      34.4483,   0.0000])
+    # scheduler.timesteps.shape
+    # torch.Size([30])
+
+    im_tensor = transforms.ToTensor()(img)
+    im_tensor = im_tensor.to(device).to(torch.float16)
+    latents = convert_to_latents(im_tensor[None, :], vae) # torch.Size([1, 4, 64, 64])
+    ref_embs = text_encoder(tokenizer(['Horse'], padding = 'max_length', max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to('cuda'))[0].half()
+    query_embs = text_encoder(tokenizer(['Zebra'], padding = 'max_length', max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to('cuda'))[0].half()
+    noise_std_dev = torch.linspace(0.4, 0.6, 10)
+    difference = torch.zeros(latents.size(), dtype = latents.dtype, device = latents.device)
+    for noise_std in tqdm(noise_std_dev):
+        noisy_latents = latents + torch.normal(mean=0, std = noise_std, size=latents.size(), device=latents.device, dtype = latents.dtype)
+        with torch.no_grad():
+            noise_r = unet(noisy_latents, scheduler.timesteps[0], ref_embs).sample
+            noise_q = unet(noisy_latents, scheduler.timesteps[0], query_embs).sample
+
+    difference += noise_q - noise_r
+    difference = difference/10
+    clipped_difference = torch.clamp(difference, min = -0.5, max = 0.5)
+    # visualizing the latents.
+    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+
+    for i in range(4):
+        axs[i].imshow(clipped_difference[0][i].to('cpu').detach().numpy(), cmap='gray')
+        axs[i].axis('off')  # Hide axes for better visualization
+        axs[i].set_title(f"Channel {i + 1}")
+
+    plt.tight_layout()
+    # plt.show()
+    plt.savefig(f'{image_save_path}/difference_image.jpg')
+    plt.close()
+    normalized_difference = (clipped_difference - clipped_difference.min()) / (clipped_difference.max() - clipped_difference.min())
+    mask = (normalized_difference > 0.5).float()
 
 if __name__ == "__main__":
     main()
