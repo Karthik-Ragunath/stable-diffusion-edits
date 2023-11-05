@@ -62,6 +62,94 @@ def convert_to_latents(image_tensor, vae):
         latents = vae.encode(image_tensor).latent_dist.sample()
     return latents
 
+def get_noise_inhalf(im_latents, prompt, scheduler, unet, vae, tokenizer, text_encoder, strength = 0.5, seed = 100, guidance_scale = 7.5, num_timesteps = 50):
+
+  torch.manual_seed(seed)
+  p_embs = encode_text(tokenizer, text_encoder, [prompt])
+
+  #scale the embeddings
+  scaled_latents = im_latents.clone() * vae.config.scaling_factor
+
+  # Get the timestep
+  scheduler.set_timesteps(num_timesteps)
+  start_timestep_index = int(num_timesteps * strength)
+
+  # Generate Noise and add the noise to the scaled latents
+  noise = torch.randn_like(scaled_latents, dtype = scaled_latents.dtype, device = scaled_latents.device)
+  noisy_latents = scheduler.add_noise(scaled_latents, noise, torch.tensor([scheduler.timesteps[start_timestep_index]], device = scaled_latents.device))
+
+  # Run the diffusion process once on that timestep and get the results
+
+  ts = scheduler.timesteps[start_timestep_index]
+  input = torch.cat([noisy_latents]*2, dim = 0)
+  input = scheduler.scale_model_input(input, ts)
+
+  with torch.no_grad():
+      noise_pred = unet(input, ts, encoder_hidden_states = p_embs).sample
+
+  u, p = noise_pred.chunk(2)
+  pred = u + guidance_scale * (p - u)
+  noisy_latents = scheduler.step(pred, ts, noisy_latents).prev_sample
+
+  return pred
+
+def get_mask(latents, ref, query, scheduler, unet, vae, tokenizer, text_encoder, n = 10):
+
+    seeds = torch.randint(low = 0, high = 7*10**6, size = (10,))
+    noise_diffs = []
+    for i, sd in enumerate(tqdm(seeds)):
+        ref_noise = get_noise_inhalf(latents, 'Horse', scheduler, unet, vae, tokenizer, text_encoder, strength = 0.5, seed = sd, guidance_scale = 7.5, num_timesteps = 50)
+        query_noise = get_noise_inhalf(latents, 'Zebra', scheduler, unet, vae, tokenizer, text_encoder, strength = 0.5, seed = sd, guidance_scale = 7.5, num_timesteps = 50)
+
+        ## Calculate Eucledian distance between two noises and then average it on axis 0
+
+        noise_diff = (query_noise - ref_noise)[0].pow(2).sum(dim = 0).pow(0.5)
+        noise_diffs.append(noise_diff[None, :])
+
+    noise_diff_t = torch.cat(noise_diffs, dim = 0)
+    noise_diff_mean = torch.mean(noise_diff_t, dim = 0)
+    # Normalization
+    normalized_difference = (noise_diff_mean - noise_diff_mean.min()) / (noise_diff_mean.max() - noise_diff_mean.min())
+    # Masking
+    mask = (normalized_difference > 0.1).float()
+    return mask
+
+def edit_image(image_latents, mask, query_text, scheduler, unet, vae, tokenizer, text_encoder, strength = 0.5, num_timesteps = 50):
+    mask = mask.to(torch.float16)
+    embs = encode_text(tokenizer, text_encoder, [query_text])
+
+    scaled_latents = image_latents.clone() * vae.config.scaling_factor
+
+    scheduler.set_timesteps(num_timesteps)
+    start_timestep_index = int(num_timesteps * strength)
+
+    # Generate Noise and add the noise to the scaled latents
+    noise = torch.randn_like(scaled_latents, dtype = scaled_latents.dtype, device = scaled_latents.device)
+
+    yt = None
+
+    for i, ts in enumerate(tqdm(scheduler.timesteps[start_timestep_index:])):
+        xt = scheduler.add_noise(scaled_latents, noise, torch.tensor([ts], device = scaled_latents.device))
+
+        if yt == None:
+            yt = xt.clone()
+
+        input = torch.cat([yt]*2, dim = 0)
+        input = scheduler.scale_model_input(input, ts)
+
+        with torch.no_grad():
+            pred = unet(input, ts, encoder_hidden_states=embs).sample
+
+        n_u, n_t = pred.chunk(2)
+        noise = n_u + 7.5 * (n_t - n_u)
+
+        yt_hat = scheduler.step(noise, ts, yt).prev_sample
+        yt = mask * yt_hat + (1 - mask) * xt
+
+    return yt
+
+
+
 def main():
     path = "fastdownloads"
     image_save_path = "save_images"
@@ -191,6 +279,28 @@ def main():
     plt.close()
     normalized_difference = (clipped_difference - clipped_difference.min()) / (clipped_difference.max() - clipped_difference.min())
     mask = (normalized_difference > 0.5).float()
+
+    im_tensor = transforms.ToTensor()(img)
+    im_tensor = im_tensor.to(device).to(torch.float16)
+    latents = convert_to_latents(im_tensor[None, :], vae) # torch.Size([1, 4, 64, 64])
+    ref_embs = text_encoder(tokenizer(['Horse'], padding = 'max_length', max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to('cuda'))[0].half()
+    query_embs = text_encoder(tokenizer(['Zebra'], padding = 'max_length', max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to('cuda'))[0].half()
+    # mask = get_mask(latents, 'Horse', 'Zebra')
+    mask = get_mask(latents=latents, ref=ref_embs, query=query_embs, scheduler=scheduler, unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder)
+    plt.imshow(mask.cpu().detach().numpy(), cmap = 'gray')
+    plt.savefig(f'{image_save_path}/mask_image.jpg')
+    plt.close()
+
+    # yt = edit_image(latents, mask, 'A zebra on a grass field with a cloudy sky', strength = 0.3, num_timesteps = 70)
+    yt = edit_image(latents, mask, 'A zebra on a grass field with a cloudy sky', scheduler=scheduler, unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, strength = 0.3, num_timesteps = 70)
+    with torch.no_grad():
+        image = vae.decode(1 / 0.18215 * yt).sample
+
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image[0].detach().cpu().permute(1, 2, 0).numpy()
+    image = (image * 255).round().astype("uint8")
+    zebra_pil_image = Image.fromarray(image)
+    zebra_pil_image.save(f"{image_save_path}/zebra.jpg")
 
 if __name__ == "__main__":
     main()
